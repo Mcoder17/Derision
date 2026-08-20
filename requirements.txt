@@ -1,0 +1,10 @@
+discord.py
+requests
+pytz
+aiofiles
+openai
+aiosqlite
+fastapi
+uvicorn
+tzdata
+python-dotenv
