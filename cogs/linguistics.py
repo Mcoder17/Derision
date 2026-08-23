@@ -18,17 +18,17 @@ from env import (
 )
 from utils.public_stats import record_messages_analyzed
 
+
 DB_DIR = "./db"
 DB_PATH = f"{DB_DIR}/linguistics.db"
-
 SEND_COMPARISON_COPY_TO_REPORT_CHANNEL = True
 
 MIN_MESSAGES = 150
 MATTR_WINDOW = 50
 
-# Data columns of user_profiles, in canonical order. user_id and updated_at
-# are handled separately. Keeping this in one place keeps the INSERT and SELECT
-# column order in sync.
+BOT_COMMAND_PREFIXES = ("!", "?", ".", "$")
+STRING_COMMAND_PREFIXES: Tuple[str, ...] = ("owo ", "owo")
+
 PROFILE_COLUMNS: Tuple[str, ...] = (
     "total_messages", "total_chars", "total_words", "total_sentences",
     "message_word_count_sum", "message_word_count_sumsq",
@@ -411,6 +411,8 @@ class Linguistics(commands.Cog):
         return None
 
     def _display_name_for(self, ctx, user_id: str) -> str:
+        # Best-effort human-readable label; falls back to the raw id. Uses no
+        # mention syntax so viewing someone's stats never pings them.
         try:
             uid_int = int(user_id)
         except (TypeError, ValueError):
@@ -936,12 +938,52 @@ class Linguistics(commands.Cog):
 
             return True
 
+    @staticmethod
+    def _looks_like_bot_command(content: str) -> bool:
+        text = (content or "").lstrip()
+        if len(text) < 2:
+            return False
+
+        # Single symbol immediately followed by a letter: "!ban", ".play".
+        if text[0] in BOT_COMMAND_PREFIXES and text[1].isalpha():
+            return True
+
+        # Literal word / letter+symbol prefixes: "pls beg", "m!play".
+        low = text.lower()
+        for prefix in STRING_COMMAND_PREFIXES:
+            pl = (prefix or "").lower()
+            if len(pl) < 2 or not low.startswith(pl):
+                continue
+            # All-letters prefixes ("pls") only count at a word boundary, so
+            # they can't fire inside a longer word ("plsomething"). Prefixes
+            # ending in a space or symbol ("pls ", "m!") are already delimited.
+            if pl[-1].isalpha():
+                rest = low[len(pl):]
+                if rest and rest[0].isalnum():
+                    continue
+            return True
+
+        return False
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.guild is None:
             return
         try:
             if message.author.bot or not message.content:
+                return
+
+            # Don't fold command invocations into linguistic profiles — the
+            # prefix, command words, IDs and mentions are noise, not natural
+            # style. First a cheap heuristic that also catches other bots'
+            # commands (e.g. "?play", "$bal"); then an authoritative check for
+            # THIS bot's own commands via get_context, which resolves its real
+            # prefix(es) even if they aren't in BOT_COMMAND_PREFIXES.
+            if self._looks_like_bot_command(message.content):
+                return
+
+            ctx = await self.bot.get_context(message)
+            if ctx.valid:
                 return
 
             metrics = self._extract_message_metrics(message.content)

@@ -14,7 +14,10 @@ NAME_CLEAN_REGEX = re.compile(r"\W+")
 
 MAX_EMOJI_BYTES = 256 * 1024
 MAX_STICKER_BYTES = 512 * 1024
-CREATE_DELAY = 1.5
+CREATE_DELAY = 1.5  # seconds between creates; emoji/sticker creation is rate limited
+
+CDN_EMOJI = "https://cdn.discordapp.com/emojis/{id}.{ext}"
+
 
 def has_expression_perm(perms: discord.Permissions) -> bool:
     """Works across discord.py versions (manage_expressions is newer,
@@ -25,12 +28,32 @@ def has_expression_perm(perms: discord.Permissions) -> bool:
     return bool(val)
 
 
+class EmojiJob:
+    """One emoji to create. `fetch` -> (data, animated, error)."""
+
+    __slots__ = ("name", "fetch")
+
+    def __init__(self, name, fetch):
+        self.name = name
+        self.fetch = fetch
+
+
+class StickerJob:
+    """One sticker to create. `fetch` -> (data, name, description, error)."""
+
+    __slots__ = ("fetch",)
+
+    def __init__(self, fetch):
+        self.fetch = fetch
+
+
 class EmojiTransfer(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.session: Optional[aiohttp.ClientSession] = None
 
     async def cog_load(self):
+        # one session for the whole cog rather than one per download
         self.session = aiohttp.ClientSession()
 
     async def cog_unload(self):
@@ -48,9 +71,9 @@ class EmojiTransfer(commands.Cog):
                 f"Missing argument: `{error.param.name}`. See `!emoji` for usage."
             )
         else:
-            raise error
+            raise error  # hand off to the bot's global error handler / logging
 
-    # ---------- helpers ----------
+    # ---------- download helpers ----------
 
     async def download(self, url, limit=MAX_EMOJI_BYTES):
         """Returns (data, None) on success or (None, reason) on failure."""
@@ -64,6 +87,28 @@ class EmojiTransfer(commands.Cog):
         if limit and len(data) > limit:
             return None, f"too large ({len(data) // 1024} KB > {limit // 1024} KB)"
         return data, None
+
+    async def download_emoji_by_id(self, eid):
+        """Fetch an emoji straight from the CDN by ID, regardless of whether the
+        bot shares a server with it. Tries animated first, then static.
+        Returns (data, animated, error)."""
+        last = None
+        for ext, animated in (("gif", True), ("png", False)):
+            data, err = await self.download(CDN_EMOJI.format(id=eid, ext=ext))
+            if data is not None:
+                return data, animated, None
+            last = err
+        return None, False, last or "no emoji found for that ID"
+
+    async def fetch_sticker_by_id(self, sid):
+        """Resolve a sticker by ID via the API — works for any sticker, not just
+        ones on servers the bot shares. Returns a Sticker or None."""
+        try:
+            return await self.bot.fetch_sticker(sid)
+        except discord.HTTPException:
+            return None
+
+    # ---------- name helpers ----------
 
     def sanitize_name(self, name: str) -> str:
         """Discord emoji names must be 2-32 chars, alphanumeric + underscore."""
@@ -87,11 +132,6 @@ class EmojiTransfer(commands.Cog):
                 return candidate
             i += 1
 
-    def slot_counts(self, guild):
-        static = sum(1 for e in guild.emojis if not e.animated)
-        animated = sum(1 for e in guild.emojis if e.animated)
-        return static, animated
-
     def parse_emoji_input(self, arg):
         arg = str(arg)
         if arg.isdigit():
@@ -100,6 +140,67 @@ class EmojiTransfer(commands.Cog):
         if m:
             return int(m.group(2))
         return None
+
+    def parse_id_token(self, token, allow_emoji=False):
+        """Parse a token like '123', '<:x:123>', or '123=name' into
+        (id_or_None, name_or_None)."""
+        name = None
+        if "=" in token:
+            token, name = token.split("=", 1)
+            name = name.strip() or None
+        token = token.strip()
+        if allow_emoji:
+            eid = self.parse_emoji_input(token)
+        else:
+            eid = int(token) if token.isdigit() else None
+        return eid, name
+
+    # ---------- job builders ----------
+
+    def job_from_emoji(self, e, name=None):
+        """Job from a cached emoji object; optional name override."""
+        async def fetch():
+            data, err = await self.download(str(e.url))
+            return data, e.animated, err
+        return EmojiJob(name or e.name, fetch)
+
+    def job_from_id(self, eid, name=None):
+        """Job from a raw emoji ID (resolved via the CDN); optional name."""
+        async def fetch():
+            return await self.download_emoji_by_id(eid)
+        return EmojiJob(name or f"emoji_{eid}", fetch)
+
+    def sticker_job_from_obj(self, s, name=None):
+        """Job from a sticker object we already hold (e.g. from stickersall)."""
+        async def fetch():
+            if s.format is discord.StickerFormatType.lottie:
+                return None, None, None, "Lottie stickers can't be re-uploaded."
+            data, err = await self.download(str(s.url), limit=MAX_STICKER_BYTES)
+            if data is None:
+                return None, None, None, err
+            return data, name or s.name, s.description or "Cloned sticker", None
+        return StickerJob(fetch)
+
+    def sticker_job_from_id(self, sid, name=None):
+        """Job from a raw sticker ID (resolved via the API); optional name."""
+        async def fetch():
+            s = await self.fetch_sticker_by_id(sid)
+            if s is None:
+                return None, None, None, f"sticker {sid} not found"
+            if s.format is discord.StickerFormatType.lottie:
+                return None, None, None, "Lottie stickers can't be re-uploaded."
+            data, err = await self.download(str(s.url), limit=MAX_STICKER_BYTES)
+            if data is None:
+                return None, None, None, err
+            return data, name or s.name, s.description or "Cloned sticker", None
+        return StickerJob(fetch)
+
+    # ---------- target / permission helpers ----------
+
+    def slot_counts(self, guild):
+        static = sum(1 for e in guild.emojis if not e.animated)
+        animated = sum(1 for e in guild.emojis if e.animated)
+        return static, animated
 
     async def resolve_target(self, ctx, target_id):
         target = self.bot.get_guild(target_id) if target_id else ctx.guild
@@ -114,7 +215,7 @@ class EmojiTransfer(commands.Cog):
             return f"I'm missing **Manage Expressions** in **{target.name}**."
 
         member = target.get_member(ctx.author.id)
-        if member is None: 
+        if member is None:  # not cached; fall back to an API fetch
             try:
                 member = await target.fetch_member(ctx.author.id)
             except discord.HTTPException:
@@ -138,42 +239,55 @@ class EmojiTransfer(commands.Cog):
         except discord.HTTPException:
             return None
 
-    async def _transfer_emojis(self, ctx, target, emojis):
-        """Shared bulk-emoji worker for sendall / send / clone.
-        Policy: always copy, renaming on name collisions."""
+    def split_target(self, ctx, items):
+        """If the first token is a plain ID resolving to a guild the bot is in,
+        treat it as the target and strip it. Returns (target, remaining_items)."""
+        target = ctx.guild
+        if items and items[0].isdigit():
+            maybe = self.bot.get_guild(int(items[0]))
+            if maybe:
+                target = maybe
+                items = items[1:]
+        return target, list(items)
+
+    # ---------- shared workers ----------
+
+    async def _transfer_emojis(self, ctx, target, jobs):
+        """Bulk-emoji worker. Always copy, renaming on collision. Animated-ness is
+        read from each job after its data is fetched (raw IDs behave like cached)."""
         limit = target.emoji_limit
         static_used, animated_used = self.slot_counts(target)
         used_names = {e.name for e in target.emojis}
 
         added = skipped = errors = 0
         last_error = None
-        total = len(emojis)
+        total = len(jobs)
         progress = await ctx.send(
             f"Starting transfer of {total} emoji(s) to **{target.name}**..."
         )
 
-        for i, emoji in enumerate(emojis, start=1):
-            if emoji.animated and animated_used >= limit:
-                skipped += 1
-                continue
-            if not emoji.animated and static_used >= limit:
-                skipped += 1
-                continue
-
-            data, derr = await self.download(str(emoji.url))
+        for i, job in enumerate(jobs, start=1):
+            data, animated, derr = await job.fetch()
             if data is None:
                 errors += 1
                 last_error = derr
                 continue
 
-            name = self.resolve_name(used_names, emoji.name)
+            if animated and animated_used >= limit:
+                skipped += 1
+                continue
+            if not animated and static_used >= limit:
+                skipped += 1
+                continue
+
+            name = self.resolve_name(used_names, job.name)
             try:
                 await target.create_custom_emoji(
                     name=name, image=data, reason=f"Transferred by {ctx.author}"
                 )
                 added += 1
                 used_names.add(name)
-                if emoji.animated:
+                if animated:
                     animated_used += 1
                 else:
                     static_used += 1
@@ -192,7 +306,7 @@ class EmojiTransfer(commands.Cog):
                 )
 
         summary = (
-            f"**Done** → {target.name}\n"
+            f"**Done** -> {target.name}\n"
             f"Added: {added}\n"
             f"Skipped (slots full): {skipped}\n"
             f"Errors: {errors}"
@@ -201,21 +315,89 @@ class EmojiTransfer(commands.Cog):
             summary += f"\nLast error: `{last_error[:150]}`"
         await progress.edit(content=summary)
 
+    async def _transfer_stickers(self, ctx, target, jobs):
+        """Bulk-sticker worker mirroring the emoji one."""
+        used = {s.name for s in target.stickers}
+        sticker_count = len(target.stickers)
+        limit = target.sticker_limit
+
+        added = skipped = errors = 0
+        last_error = None
+        total = len(jobs)
+        progress = await ctx.send(
+            f"Transferring {total} sticker(s) to **{target.name}**..."
+        )
+
+        for i, job in enumerate(jobs, start=1):
+            if sticker_count >= limit:
+                skipped += 1
+                continue
+
+            data, name, description, err = await job.fetch()
+            if data is None:
+                # Lottie / unsupported counts as skipped, real failures as errors
+                if err and "Lottie" in err:
+                    skipped += 1
+                else:
+                    errors += 1
+                last_error = err
+                continue
+
+            name = self.resolve_name(used, name)
+            try:
+                file = discord.File(BytesIO(data), filename="sticker.png")
+                await target.create_sticker(
+                    name=name,
+                    description=description,
+                    emoji="🙂",
+                    file=file,
+                    reason=f"Cloned by {ctx.author}",
+                )
+                added += 1
+                sticker_count += 1
+                used.add(name)
+                await asyncio.sleep(CREATE_DELAY)
+            except discord.HTTPException as e:
+                errors += 1
+                last_error = str(e)
+                log.warning("Sticker create failed (%s): %s", name, e)
+
+            if i % 3 == 0 or i == total:
+                await progress.edit(
+                    content=(
+                        f"{i}/{total} | added {added} | "
+                        f"skipped {skipped} | errors {errors}"
+                    )
+                )
+
+        summary = (
+            f"**Done** -> {target.name}\n"
+            f"Added: {added}\nSkipped: {skipped}\nErrors: {errors}"
+        )
+        if last_error:
+            summary += f"\nLast note: `{last_error[:150]}`"
+        await progress.edit(content=summary)
+
     # ---------- command group ----------
 
     @commands.guild_only()
     @commands.group(name="emoji", invoke_without_command=True)
     async def emoji(self, ctx):
         await ctx.send(
-            "**Emoji / sticker tools** (TARGET defaults to this server):\n"
+            "**Emoji / sticker tools** (TARGET defaults to this server).\n"
+            "By-ID commands accept `ID=name` to name each item.\n\n"
+            "__Emojis__\n"
             "`!emoji info [TARGET]` — show slot usage\n"
             "`!emoji sendall [TARGET]` — copy all emojis from here\n"
-            "`!emoji send [TARGET] <ids/emojis>` — copy selected emojis\n"
+            "`!emoji send [TARGET] <ids/emojis>` — copy emojis (works on any ID)\n"
+            "`!emoji grab [TARGET] <ids/emojis>` — copy emojis by ID from anywhere\n"
             "`!emoji clone <SOURCE_ID> [TARGET]` — copy all emojis from another server\n"
             "`!emoji fromurl [TARGET] <url> [name]` — add an emoji from a link\n"
             "`!emoji add [TARGET] [name]` — reply to an image\n"
-            "`!emoji delete [TARGET] <name/emoji>` — remove an emoji\n"
+            "`!emoji delete [TARGET] <name/emoji>` — remove an emoji\n\n"
+            "__Stickers__\n"
             "`!emoji sticker [TARGET] [name]` — reply to a sticker/image\n"
+            "`!emoji stickergrab [TARGET] <ids>` — copy stickers by ID from anywhere\n"
             "`!emoji stickersall [TARGET]` — copy all stickers from here"
         )
 
@@ -246,7 +428,7 @@ class EmojiTransfer(commands.Cog):
         emojis = list(ctx.guild.emojis)
         if not emojis:
             return await ctx.send("This server has no emojis to copy.")
-        await self._transfer_emojis(ctx, target, emojis)
+        await self._transfer_emojis(ctx, target, [self.job_from_emoji(e) for e in emojis])
 
     @emoji.command()
     @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
@@ -254,44 +436,54 @@ class EmojiTransfer(commands.Cog):
         if not args:
             return await ctx.send(
                 "Give me emoji IDs or custom emojis, e.g. `!emoji send :blob: 123456789`.\n"
-                "Optionally start with a target server ID. "
+                "Use `ID=name` to rename. Optionally start with a target server ID.\n"
                 "For a plain image, reply to it with `!emoji add`."
             )
 
-        target = ctx.guild
-        items = list(args)
-
-        if items[0].isdigit():
-            maybe = self.bot.get_guild(int(items[0]))
-            if maybe:
-                target = maybe
-                items = items[1:]
-
+        target, items = self.split_target(ctx, list(args))
         perm_err = await self.check_perms(ctx, target)
         if perm_err:
             return await ctx.send(perm_err)
 
-        ids = [eid for eid in (self.parse_emoji_input(x) for x in items) if eid]
-        if not ids:
-            return await ctx.send("No valid emoji IDs or custom emojis found.")
-
-        emojis, missing = [], 0
-        for eid in ids:
-            e = self.bot.get_emoji(eid)
-            if e:
-                emojis.append(e)
-            else:
-                missing += 1
-
-        if not emojis:
-            return await ctx.send(
-                "I couldn't access any of those emojis "
-                "(I need to share a server with them)."
+        jobs = []
+        for token in items:
+            eid, name = self.parse_id_token(token, allow_emoji=True)
+            if not eid:
+                continue
+            cached = self.bot.get_emoji(eid)
+            jobs.append(
+                self.job_from_emoji(cached, name) if cached else self.job_from_id(eid, name)
             )
 
-        await self._transfer_emojis(ctx, target, emojis)
-        if missing:
-            await ctx.send(f"Note: {missing} emoji ID(s) couldn't be resolved.")
+        if not jobs:
+            return await ctx.send("No valid emoji IDs or custom emojis found.")
+        await self._transfer_emojis(ctx, target, jobs)
+
+    @emoji.command()
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
+    async def grab(self, ctx, *args):
+        """Copy emojis purely by ID, straight from the CDN — no shared server
+        required. Accepts raw IDs, pasted custom emojis, or `ID=name`."""
+        if not args:
+            return await ctx.send(
+                "Give me emoji IDs, e.g. `!emoji grab 123456789 987654321=cool`.\n"
+                "Use `ID=name` to rename. Optionally start with a target server ID."
+            )
+
+        target, items = self.split_target(ctx, list(args))
+        perm_err = await self.check_perms(ctx, target)
+        if perm_err:
+            return await ctx.send(perm_err)
+
+        jobs = []
+        for token in items:
+            eid, name = self.parse_id_token(token, allow_emoji=True)
+            if eid:
+                jobs.append(self.job_from_id(eid, name))
+
+        if not jobs:
+            return await ctx.send("No valid emoji IDs found.")
+        await self._transfer_emojis(ctx, target, jobs)
 
     @emoji.command()
     @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
@@ -311,7 +503,7 @@ class EmojiTransfer(commands.Cog):
         emojis = list(source.emojis)
         if not emojis:
             return await ctx.send("That source server has no emojis.")
-        await self._transfer_emojis(ctx, target, emojis)
+        await self._transfer_emojis(ctx, target, [self.job_from_emoji(e) for e in emojis])
 
     @emoji.command()
     async def fromurl(self, ctx, target_id: Optional[int], url: str, *, name: str = None):
@@ -452,8 +644,34 @@ class EmojiTransfer(commands.Cog):
         except discord.HTTPException as e:
             await ctx.send(
                 f"Failed to create sticker: `{e}`\n"
-                "Stickers must be 320×320 PNG/APNG under 512 KB."
+                "Stickers must be 320x320 PNG/APNG under 512 KB."
             )
+
+    @emoji.command()
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
+    async def stickergrab(self, ctx, *args):
+        """Copy stickers by ID from anywhere (resolved via the API). Accepts raw
+        IDs or `ID=name`."""
+        if not args:
+            return await ctx.send(
+                "Give me sticker IDs, e.g. `!emoji stickergrab 123456789 987=name`.\n"
+                "Use `ID=name` to rename. Optionally start with a target server ID."
+            )
+
+        target, items = self.split_target(ctx, list(args))
+        perm_err = await self.check_perms(ctx, target)
+        if perm_err:
+            return await ctx.send(perm_err)
+
+        jobs = []
+        for token in items:
+            sid, name = self.parse_id_token(token)  # stickers: plain IDs only
+            if sid:
+                jobs.append(self.sticker_job_from_id(sid, name))
+
+        if not jobs:
+            return await ctx.send("No valid sticker IDs found.")
+        await self._transfer_stickers(ctx, target, jobs)
 
     @emoji.command()
     @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
@@ -468,67 +686,9 @@ class EmojiTransfer(commands.Cog):
         stickers = list(ctx.guild.stickers)
         if not stickers:
             return await ctx.send("This server has no stickers.")
-
-        used = {s.name for s in target.stickers}
-        sticker_count = len(target.stickers)
-        limit = target.sticker_limit
-
-        added = skipped = errors = 0
-        last_error = None
-        total = len(stickers)
-        progress = await ctx.send(
-            f"Transferring {total} sticker(s) to **{target.name}**..."
+        await self._transfer_stickers(
+            ctx, target, [self.sticker_job_from_obj(s) for s in stickers]
         )
-
-        for i, sticker in enumerate(stickers, start=1):
-            if sticker_count >= limit:
-                skipped += 1
-                continue
-            if sticker.format is discord.StickerFormatType.lottie:
-                skipped += 1
-                last_error = "Lottie stickers can't be re-uploaded."
-                continue
-
-            data, derr = await self.download(str(sticker.url), limit=MAX_STICKER_BYTES)
-            if data is None:
-                errors += 1
-                last_error = derr
-                continue
-
-            name = self.resolve_name(used, sticker.name)
-            try:
-                file = discord.File(BytesIO(data), filename="sticker.png")
-                await target.create_sticker(
-                    name=name,
-                    description=sticker.description or "Cloned sticker",
-                    emoji="🙂",
-                    file=file,
-                    reason=f"Cloned by {ctx.author}",
-                )
-                added += 1
-                sticker_count += 1
-                used.add(name)
-                await asyncio.sleep(CREATE_DELAY)
-            except discord.HTTPException as e:
-                errors += 1
-                last_error = str(e)
-                log.warning("Sticker create failed (%s): %s", name, e)
-
-            if i % 3 == 0 or i == total:
-                await progress.edit(
-                    content=(
-                        f"{i}/{total} | added {added} | "
-                        f"skipped {skipped} | errors {errors}"
-                    )
-                )
-
-        summary = (
-            f"**Done** → {target.name}\n"
-            f"Added: {added}\nSkipped: {skipped}\nErrors: {errors}"
-        )
-        if last_error:
-            summary += f"\nLast note: `{last_error[:150]}`"
-        await progress.edit(content=summary)
 
 
 async def setup(bot):
