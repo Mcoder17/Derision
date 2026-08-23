@@ -16,7 +16,6 @@ MAX_EMOJI_BYTES = 256 * 1024
 MAX_STICKER_BYTES = 512 * 1024
 CREATE_DELAY = 1.5
 
-
 def has_expression_perm(perms: discord.Permissions) -> bool:
     """Works across discord.py versions (manage_expressions is newer,
     manage_emojis_and_stickers is the deprecated alias)."""

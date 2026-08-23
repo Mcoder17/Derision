@@ -18,7 +18,6 @@ from env import (
 )
 from utils.public_stats import record_messages_analyzed
 
-
 DB_DIR = "./db"
 DB_PATH = f"{DB_DIR}/linguistics.db"
 
